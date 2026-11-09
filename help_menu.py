@@ -9,6 +9,7 @@ the command tree. The menu derives its branding and command list from that bot.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -28,6 +29,106 @@ def _children(command: Any) -> list[Any]:
 def _description(command: Any) -> str:
     value = getattr(command, "description", None)
     return (str(value).strip() if value else "No description provided.")[:100]
+
+
+def _command_emoji_keys(command: Any) -> list[str]:
+    name = str(getattr(command, "name", "")).lower().replace("-", "_")
+    keys = [name] if name else []
+    root = name.split("_", 1)[0] if name else ""
+    if root and root not in keys:
+        keys.append(root)
+    return keys
+
+
+async def _ensure_app_emojis(bot: Any) -> dict[str, str]:
+    """Fetch this bot's application emojis once and cache them on the bot."""
+    if getattr(bot, "_help_app_emojis_loaded", False):
+        cached = getattr(bot, "_help_app_emojis", {})
+        return cached if isinstance(cached, dict) else {}
+
+    task = getattr(bot, "_help_app_emojis_task", None)
+    if task is None:
+        async def fetch() -> dict[str, str]:
+            fetcher = getattr(bot, "fetch_application_emojis", None)
+            if not callable(fetcher):
+                return {}
+            try:
+                fetched = await fetcher()
+                return {
+                    str(item.name).lower(): str(item)
+                    for item in (fetched or [])
+                    if getattr(item, "name", None)
+                }
+            except Exception as exc:
+                log.debug("Could not fetch application emojis for %s: %s", _bot_name(bot), exc)
+                return {}
+
+        task = asyncio.create_task(fetch())
+        try:
+            setattr(bot, "_help_app_emojis_task", task)
+        except Exception:
+            pass
+
+    try:
+        result = await task
+    except Exception as exc:
+        log.debug("Application emoji loading failed: %s", exc)
+        result = {}
+
+    try:
+        setattr(bot, "_help_app_emojis", result)
+        setattr(bot, "_help_app_emojis_loaded", True)
+    except Exception:
+        pass
+    return result
+
+
+def _lookup_emoji(mapping: Any, keys: list[str]) -> str | None:
+    if not isinstance(mapping, dict):
+        return None
+    normalized = {str(key).lower().replace("-", "_"): value for key, value in mapping.items()}
+    for key in keys:
+        value = normalized.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _resolve_command_emoji(
+    bot: Any, command: Any, explicit_emojis: dict[str, str] | None = None
+) -> str:
+    keys = _command_emoji_keys(command)
+    value = _lookup_emoji(explicit_emojis, keys)
+    if value:
+        return value
+
+    app_emojis = getattr(bot, "_help_app_emojis", {})
+    value = _lookup_emoji(app_emojis, keys)
+    if value:
+        return value
+
+    guild_emojis: dict[str, str] = {}
+    for item in getattr(bot, "emojis", []) or []:
+        if getattr(item, "name", None):
+            guild_emojis[str(item.name).lower()] = str(item)
+    value = _lookup_emoji(guild_emojis, keys)
+    if value:
+        return value
+
+    default = app_emojis.get("default") if isinstance(app_emojis, dict) else None
+    if default:
+        return str(default)
+    return "📂" if _children(command) else "📌"
+
+
+def _select_emoji(value: str) -> Any:
+    """Parse custom emoji markup safely; Unicode emoji can be passed directly."""
+    if isinstance(value, str) and value.startswith(("<:", "<a:")):
+        try:
+            return discord.PartialEmoji.from_str(value)
+        except (TypeError, ValueError, AttributeError):
+            return None
+    return value or None
 
 
 def _qualified_name(command: Any) -> str:
@@ -118,7 +219,12 @@ def _registered_commands(bot: Any) -> list[Any]:
     )
 
 
-def _base_embed(bot: Any, commands: list[Any]) -> discord.Embed:
+def _base_embed(
+    bot: Any,
+    commands: list[Any],
+    page: int = 0,
+    emojis: dict[str, str] | None = None,
+) -> discord.Embed:
     name = _bot_name(bot)
     embed = discord.Embed(
         title=f"📚 {name} — Help Center"[:256],
@@ -135,20 +241,39 @@ def _base_embed(bot: Any, commands: list[Any]) -> discord.Embed:
             inline=False,
         )
     else:
-        # Keep the overview compact; the dropdown is the complete command browser.
-        rows = []
-        for command in commands[:15]:
+        page_size = 21
+        page = max(0, page)
+        page_commands = commands[page * page_size:(page + 1) * page_size]
+        for command in page_commands:
             child_count = len(_children(command))
-            suffix = f" · {child_count} subcommands" if child_count else ""
-            rows.append(f"• **/{_qualified_name(command)}** — {_description(command)}{suffix}")
-        if len(commands) > 15:
-            rows.append(f"…and {len(commands) - 15} more. Use the dropdown to browse all commands.")
-        embed.add_field(name="Available commands", value="\n".join(rows)[:1024], inline=False)
+            emoji = _resolve_command_emoji(bot, command, emojis)
+            title = str(getattr(command, "name", _qualified_name(command)))
+            title = title.replace("-", " ").replace("_", " ").title()
+            command_name = str(getattr(command, "name", _qualified_name(command)))
+            detail = f"`/{command_name}`"
+            detail += f" · {child_count} subcommands" if child_count else " · Command"
+            embed.add_field(
+                name=f"{emoji} {title}"[:256],
+                value=f"{_description(command)}\n{detail}"[:1024],
+                inline=True,
+            )
+
+        remainder = len(page_commands) % 3
+        if remainder:
+            for _ in range(3 - remainder):
+                embed.add_field(name="\\u200b", value="\\u200b", inline=True)
+
+        total_pages = max(1, (len(commands) + page_size - 1) // page_size)
+        embed.set_footer(
+            text=f"{name} • Interactive Help" +
+                 (f" • Page {page + 1}/{total_pages}" if total_pages > 1 else "")
+        )
 
     avatar = _bot_avatar(bot)
     if avatar:
         embed.set_thumbnail(url=avatar)
-    embed.set_footer(text=f"{name} • Interactive Help")
+    if not commands:
+        embed.set_footer(text=f"{name} • Interactive Help")
     return embed
 
 
@@ -159,6 +284,7 @@ class HelpCenterView(discord.ui.View):
         super().__init__(timeout=timeout)
         self.bot = bot
         self.owner_id = owner_id
+        self.emojis = getattr(bot, "_help_explicit_emojis", {})
         self.commands = _registered_commands(bot)
         self.path: list[Any] = []
         self.page = 0
@@ -184,10 +310,11 @@ class HelpCenterView(discord.ui.View):
     def _build(self) -> None:
         self.clear_items()
         nodes = self.current_nodes
-        max_page = max(0, (len(nodes) - 1) // 25)
+        page_size = 21 if not self.path else 25
+        max_page = max(0, (len(nodes) - 1) // page_size)
         self.page = min(self.page, max_page)
-        start = self.page * 25
-        page_nodes = nodes[start:start + 25]
+        start = self.page * page_size
+        page_nodes = nodes[start:start + page_size]
 
         if page_nodes:
             options = []
@@ -201,6 +328,7 @@ class HelpCenterView(discord.ui.View):
                     label=label,
                     value=str(start + page_nodes.index(node)),
                     description=description[:100],
+                    emoji=_select_emoji(_resolve_command_emoji(self.bot, node, self.emojis)),
                 ))
             select = discord.ui.Select(
                 placeholder="Choose a command or subcommand…",
@@ -261,14 +389,14 @@ class HelpCenterView(discord.ui.View):
 
     def _current_embed(self) -> discord.Embed:
         if not self.path:
-            return _base_embed(self.bot, self.commands)
+            return _base_embed(self.bot, self.commands, page=self.page, emojis=self.emojis)
 
         command = self.current
         name = _bot_name(self.bot)
         children = _children(command)
         qualified = _qualified_name(command)
         embed = discord.Embed(
-            title=(f"📂 /{qualified}" if children else f"📌 /{qualified}")[:256],
+            title=f"{_resolve_command_emoji(self.bot, command, self.emojis)} /{qualified}"[:256],
             description=_description(command),
             color=discord.Color.blurple(),
         )
@@ -354,7 +482,8 @@ class HelpCenterView(discord.ui.View):
         await interaction.response.edit_message(embed=self._current_embed(), view=self)
 
     async def _on_next(self, interaction: discord.Interaction) -> None:
-        max_page = max(0, (len(self.current_nodes) - 1) // 25)
+        page_size = 21 if not self.path else 25
+        max_page = max(0, (len(self.current_nodes) - 1) // page_size)
         self.page = min(max_page, self.page + 1)
         self._build()
         await interaction.response.edit_message(embed=self._current_embed(), view=self)
@@ -379,6 +508,7 @@ def setup_help(
     ephemeral: bool = True,
     timeout: float = 300,
     replace_existing: bool = True,
+    emojis: dict[str, str] | None = None,
 ):
     """Register a reusable /help command on any discord.py Bot or AutoShardedBot.
 
@@ -387,6 +517,8 @@ def setup_help(
     if not hasattr(bot, "tree"):
         raise TypeError("setup_help(bot) requires a discord.py bot with an application-command tree.")
 
+    setattr(bot, "_help_explicit_emojis", emojis or {})
+
     existing = bot.tree.get_command(command_name)
     if existing is not None:
         if not replace_existing:
@@ -394,8 +526,9 @@ def setup_help(
         bot.tree.remove_command(command_name)
 
     async def help_callback(interaction: discord.Interaction) -> None:
+        await _ensure_app_emojis(bot)
         view = HelpCenterView(bot, interaction.user.id, timeout=timeout)
-        embed = _base_embed(bot, view.commands)
+        embed = _base_embed(bot, view.commands, page=view.page, emojis=emojis)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
         try:
             view.message = await interaction.original_response()
